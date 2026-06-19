@@ -109,6 +109,29 @@
 			<menupopup> </menupopup>
 		</menulist>
 	</groupbox>
+
+	<!-- Smart Reading Completion -->
+	<groupbox>
+		<label>
+			<html:h2 data-l10n-id="pref-smartcompletion-title"></html:h2>
+		</label>
+		<checkbox id="zotero-prefpane-__addonRef__-auto-complete-on-finish"
+			preference="extensions.zotero.__addonRef__.auto-complete-on-finish"
+			data-l10n-id="pref-auto-complete-on-finish"
+			onclick="Zotero.__addonInstance__.prefsMenu.setCompletionOptionsVisibility(window)" />
+		<html:div id="completion-options">
+			<html:label data-l10n-id="pref-completion-status-label" />
+			<menulist id="completion-status-menulist" native="true"
+				preference="extensions.zotero.__addonRef__.completion-status">
+				<menupopup> </menupopup>
+			</menulist>
+			<html:br />
+			<html:label data-l10n-id="pref-completion-threshold-label" />
+			<html:input id="completion-threshold-input" type="number" min="1" max="100"
+				preference="extensions.zotero.__addonRef__.completion-threshold"
+				onchange="Zotero.__addonInstance__.prefsMenu.saveCompletionThreshold(window)" />
+		</html:div>
+	</groupbox>
 </vbox>
 <vbox class="main-section">
 	<html:label data-l10n-id="pref-help"

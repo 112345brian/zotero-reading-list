@@ -35,3 +35,9 @@ pref-openitemtable-button-save = Save
 pref-openitemtable-button-reset = Reset to Default
 
 pref-autolabelnewitems-title = Automatically label new items when you add them to Zotero
+
+pref-smartcompletion-title = Smart Reading Completion
+pref-auto-complete-on-finish =
+    .label = Automatically mark items as finished when you reach the end
+pref-completion-threshold-label = Completion threshold (% of pages, used when no table of contents is detected)
+pref-completion-status-label = Status to set on completion

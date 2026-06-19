@@ -15,9 +15,17 @@ import {
 	clearItemExtraProperty,
 	removeFieldValueFromExtraData,
 } from "../utils/extraField";
+import {
+	parseProgress,
+	formatProgress,
+	detectContentEndPage,
+} from "../utils/readingProgress";
+
 const READ_STATUS_COLUMN_ID = "readstatus";
 const READ_STATUS_EXTRA_FIELD = "Read_Status";
 const READ_DATE_EXTRA_FIELD = "Read_Status_Date";
+const READ_PROGRESS_EXTRA_FIELD = "Read_Progress"; // "highwater/total" (1-indexed pages)
+const READ_LAST_OPEN_EXTRA_FIELD = "Read_Last_Open"; // ISO date of last PDF open
 
 export const DEFAULT_STATUS_NAMES = [
 	"New",
@@ -43,6 +51,9 @@ export const ENABLE_KEYBOARD_SHORTCUTS_PREF = "enable-keyboard-shortcuts";
 export const STATUS_NAME_AND_ICON_LIST_PREF = "statuses-and-icons-list";
 export const STATUS_CHANGE_ON_OPEN_ITEM_LIST_PREF =
 	"status-change-on-open-item-list";
+export const AUTO_COMPLETE_PREF = "auto-complete-on-finish";
+export const COMPLETION_THRESHOLD_PREF = "completion-threshold"; // integer 0–100
+export const COMPLETION_STATUS_PREF = "completion-status"; // status name to set on finish
 
 enum ReadStatusFormat {
 	ShowBoth = 0,
@@ -110,6 +121,18 @@ export default class ZoteroReadingList {
 	statusNames: string[];
 	statusIcons: string[];
 
+	// Reading progress tracking
+	private readerTrackerListeners: Map<
+		string,
+		{
+			pdfApp: _ZoteroTypes.Reader.PDFViewerApplication;
+			listener: (event: { pageNumber: number }) => void;
+		}
+	> = new Map();
+	private saveDebounceTimers: Map<number, ReturnType<typeof setTimeout>> =
+		new Map();
+	private isReaderTrackerPatched = false;
+
 	constructor() {
 		this.initialiseDefaultPreferences();
 		[this.statusNames, this.statusIcons] = prefStringToList(
@@ -132,6 +155,7 @@ export default class ZoteroReadingList {
 
 		this.addPreferenceUpdateObservers();
 		this.removeReadStatusFromExports();
+		this.addProgressTracker();
 	}
 
 	public unload() {
@@ -143,6 +167,7 @@ export default class ZoteroReadingList {
 		this.removeFileOpenedListener();
 		this.removePreferenceUpdateObservers();
 		this.unpatchExportFunction();
+		this.removeProgressTracker();
 	}
 
 	initialiseDefaultPreferences() {
@@ -180,6 +205,10 @@ export default class ZoteroReadingList {
 				DEFAULT_STATUS_CHANGE_TO,
 			),
 		);
+		initialiseDefaultPref(AUTO_COMPLETE_PREF, true);
+		initialiseDefaultPref(COMPLETION_THRESHOLD_PREF, 90);
+		initialiseDefaultPref(COMPLETION_STATUS_PREF, "");
+
 		// for migrating from old label new items pref (true or false) to new format pref (disabled or choose read status to use)
 		// true -> automatically label as first read status
 		// false -> disabled
@@ -570,6 +599,14 @@ export default class ZoteroReadingList {
 							extraText,
 							READ_DATE_EXTRA_FIELD,
 						);
+						extraText = removeFieldValueFromExtraData(
+							extraText,
+							READ_PROGRESS_EXTRA_FIELD,
+						);
+						extraText = removeFieldValueFromExtraData(
+							extraText,
+							READ_LAST_OPEN_EXTRA_FIELD,
+						);
 						// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
 						serializedItem.extra = extraText;
 					}
@@ -581,5 +618,189 @@ export default class ZoteroReadingList {
 
 	unpatchExportFunction() {
 		$unpatch$(Zotero.Utilities.Internal, "itemToExportFormat");
+	}
+
+	// ── Reading progress tracking ──────────────────────────────────────────
+
+	addProgressTracker() {
+		const self = this;
+
+		// Patch any readers already open (e.g. on plugin reload during development)
+		for (const reader of Zotero.Reader._readers) {
+			void self.setupReaderTracking(reader);
+		}
+
+		// Intercept future reader opens
+		$patch$(
+			Zotero.Reader,
+			"open",
+			(original) =>
+				async function (
+					this: object,
+					itemID: number,
+					location?: _ZoteroTypes.Reader.Location,
+					options?: _ZoteroTypes.Reader.OpenOptions,
+				) {
+					const result = (await original.call(
+						this,
+						itemID,
+						location,
+						options,
+					)) as _ZoteroTypes.ReaderInstance | undefined;
+					const reader =
+						result ??
+						Zotero.Reader._readers.find((r) => r.itemID === itemID);
+					if (reader) void self.setupReaderTracking(reader);
+					return result;
+				},
+		);
+		this.isReaderTrackerPatched = true;
+	}
+
+	removeProgressTracker() {
+		// Remove eventBus listeners from each tracked reader
+		for (const { pdfApp, listener } of this.readerTrackerListeners.values()) {
+			pdfApp.eventBus?.off("pagechanging", listener);
+		}
+		this.readerTrackerListeners.clear();
+
+		// Flush any pending debounced saves
+		for (const timer of this.saveDebounceTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.saveDebounceTimers.clear();
+
+		if (this.isReaderTrackerPatched) {
+			$unpatch$(Zotero.Reader, "open");
+			this.isReaderTrackerPatched = false;
+		}
+	}
+
+	private async setupReaderTracking(reader: _ZoteroTypes.ReaderInstance) {
+		if (reader.type !== "pdf") return;
+		if (this.readerTrackerListeners.has(reader._instanceID)) return;
+
+		try {
+			await reader._initPromise;
+
+			const pdfView =
+				reader._primaryView as _ZoteroTypes.Reader.PDFView;
+			await pdfView.initializedPromise;
+
+			const pdfApp = pdfView._iframeWindow?.PDFViewerApplication;
+			if (!pdfApp) return;
+
+			await pdfApp.initializedPromise;
+
+			const totalPages = pdfApp.pagesCount;
+			if (!totalPages) return;
+
+			const parentItem = reader._item.parentItem ?? reader._item;
+
+			// Record that this item was opened now
+			setItemExtraProperty(
+				parentItem,
+				READ_LAST_OPEN_EXTRA_FIELD,
+				new Date().toISOString(),
+			);
+			this.debouncedSave(parentItem);
+
+			// Detect where back matter begins (references, appendix, etc.)
+			const contentEndPage = await detectContentEndPage(pdfApp);
+
+			// Listen to pdf.js page-change events
+			const listener = ({ pageNumber }: { pageNumber: number }) => {
+				void this.onPageChange(
+					parentItem,
+					pageNumber,
+					totalPages,
+					contentEndPage,
+				);
+			};
+
+			pdfApp.eventBus?.on("pagechanging", listener);
+			this.readerTrackerListeners.set(reader._instanceID, {
+				pdfApp,
+				listener,
+			});
+
+			// Check the page the reader is already on
+			if (pdfApp.page) {
+				void this.onPageChange(
+					parentItem,
+					pdfApp.page,
+					totalPages,
+					contentEndPage,
+				);
+			}
+		} catch (e) {
+			ztoolkit.log(`[ReadingProgress] setup error: ${e}`);
+		}
+	}
+
+	private async onPageChange(
+		parentItem: Zotero.Item,
+		pageNumber: number, // 1-indexed
+		totalPages: number,
+		contentEndPage: number | null, // 1-indexed page where back matter starts, or null
+	) {
+		const progressStrs = getItemExtraProperty(
+			parentItem,
+			READ_PROGRESS_EXTRA_FIELD,
+		);
+		const currentProgress =
+			progressStrs.length === 1 ? parseProgress(progressStrs[0]) : null;
+		const currentHwm = currentProgress?.highwaterPage ?? 0;
+
+		if (pageNumber <= currentHwm) return; // no new ground covered
+
+		setItemExtraProperty(
+			parentItem,
+			READ_PROGRESS_EXTRA_FIELD,
+			formatProgress(pageNumber, totalPages),
+		);
+		this.debouncedSave(parentItem);
+
+		if (!getPref(AUTO_COMPLETE_PREF)) return;
+
+		const threshold =
+			((getPref(COMPLETION_THRESHOLD_PREF) as number) ?? 90) / 100;
+		const completionPage =
+			contentEndPage ?? Math.ceil(totalPages * threshold);
+
+		if (pageNumber >= completionPage) {
+			const completionStatus = this.resolveCompletionStatus();
+			if (getItemReadStatus(parentItem) !== completionStatus) {
+				setItemReadStatus(parentItem, completionStatus);
+			}
+		}
+	}
+
+	private resolveCompletionStatus(): string {
+		const saved = getPref(COMPLETION_STATUS_PREF) as string;
+		if (saved && this.statusNames.includes(saved)) return saved;
+		// Default: first status whose name contains "read" (case-insensitive),
+		// otherwise the 4th status (index 3), otherwise the last status.
+		const readLike = this.statusNames.find((n) =>
+			/read/i.test(n),
+		);
+		return (
+			readLike ??
+			this.statusNames[3] ??
+			this.statusNames[this.statusNames.length - 1]
+		);
+	}
+
+	private debouncedSave(item: Zotero.Item) {
+		const id = item.id;
+		const existing = this.saveDebounceTimers.get(id);
+		if (existing) clearTimeout(existing);
+		this.saveDebounceTimers.set(
+			id,
+			setTimeout(() => {
+				void item.saveTx();
+				this.saveDebounceTimers.delete(id);
+			}, 2000),
+		);
 	}
 }

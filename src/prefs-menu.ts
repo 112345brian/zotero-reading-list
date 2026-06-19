@@ -9,6 +9,9 @@ import {
 	FORBIDDEN_PREF_STRING_CHARACTERS,
 	LABEL_NEW_ITEMS_PREF,
 	LABEL_NEW_ITEMS_PREF_DISABLED,
+	AUTO_COMPLETE_PREF,
+	COMPLETION_STATUS_PREF,
+	COMPLETION_THRESHOLD_PREF,
 	prefStringToList,
 	listToPrefString,
 } from "./modules/overlay";
@@ -21,11 +24,19 @@ const OPEN_ITEM_HIDDEN_ROW = "openitem-table-hidden-row";
 const OPEN_ITEM_CHECKBOX =
 	"zotero-prefpane-zotero-reading-list-label-items-when-opening-file";
 const LABEL_NEW_ITEMS_MENU_LIST = "automatically-label-new-items-menulist";
+const COMPLETION_STATUS_MENU_LIST = "completion-status-menulist";
+const COMPLETION_THRESHOLD_INPUT = "completion-threshold-input";
+const COMPLETION_OPTIONS_DIV = "completion-options";
+const AUTO_COMPLETE_CHECKBOX =
+	"zotero-prefpane-zotero-reading-list-auto-complete-on-finish";
 
 function onPrefsLoad(window: Window) {
 	setTableStatusNames(window);
 	setTableOpenItem(window);
 	fillAutomaticallyLabelNewItemsMenuList(window);
+	fillCompletionStatusMenuList(window);
+	setCompletionOptionsVisibility(window);
+	setCompletionThresholdValue(window);
 }
 
 function resetPrefsMenu(window: Window) {
@@ -33,6 +44,8 @@ function resetPrefsMenu(window: Window) {
 	setTableOpenItem(window);
 	clearAutomaticallyLabelNewItemsMenuList(window);
 	fillAutomaticallyLabelNewItemsMenuList(window);
+	clearCompletionStatusMenuList(window);
+	fillCompletionStatusMenuList(window);
 }
 
 function setTableStatusNames(window: Window) {
@@ -401,6 +414,72 @@ function clearAutomaticallyLabelNewItemsMenuList(window: Window) {
 	Array.from(listRows ?? []).map((row) => row.remove());
 }
 
+function fillCompletionStatusMenuList(window: Window) {
+	const menuList = window.document.getElementById(
+		COMPLETION_STATUS_MENU_LIST,
+	)! as unknown as XULMenuListElement;
+	if (!menuList) return;
+
+	const [statusNames, statusIcons] = prefStringToList(
+		getPref(STATUS_NAME_AND_ICON_LIST_PREF) as string,
+	);
+	const savedStatus = getPref(COMPLETION_STATUS_PREF) as string;
+
+	statusNames.forEach((statusName, index) => {
+		const statusString = `${statusIcons[index]} ${statusName}`;
+		menuList.appendItem(statusString, statusName);
+	});
+
+	const savedIndex = statusNames.indexOf(savedStatus);
+	// Default to the first status whose name contains "read", or index 3 (Read), or last
+	if (savedIndex >= 0) {
+		menuList.selectedIndex = savedIndex;
+	} else {
+		const readLikeIndex = statusNames.findIndex((n) => /read/i.test(n));
+		menuList.selectedIndex =
+			readLikeIndex >= 0
+				? readLikeIndex
+				: Math.min(3, statusNames.length - 1);
+	}
+}
+
+function clearCompletionStatusMenuList(window: Window) {
+	const listRows = window.document.getElementById(
+		COMPLETION_STATUS_MENU_LIST,
+	)?.children;
+	Array.from(listRows ?? []).map((row) => row.remove());
+}
+
+function setCompletionOptionsVisibility(window: Window) {
+	const checkbox = window.document.getElementById(
+		AUTO_COMPLETE_CHECKBOX,
+	) as HTMLInputElement;
+	const optionsDiv = window.document.getElementById(COMPLETION_OPTIONS_DIV);
+	if (optionsDiv && checkbox) {
+		optionsDiv.hidden = !checkbox.checked;
+	}
+}
+
+function setCompletionThresholdValue(window: Window) {
+	const input = window.document.getElementById(
+		COMPLETION_THRESHOLD_INPUT,
+	) as HTMLInputElement;
+	if (input) {
+		input.value = String(getPref(COMPLETION_THRESHOLD_PREF) ?? 90);
+	}
+}
+
+function saveCompletionThreshold(window: Window) {
+	const input = window.document.getElementById(
+		COMPLETION_THRESHOLD_INPUT,
+	) as HTMLInputElement;
+	if (input) {
+		const val = Math.max(1, Math.min(100, parseInt(input.value, 10) || 90));
+		setPref(COMPLETION_THRESHOLD_PREF, val);
+		input.value = String(val);
+	}
+}
+
 export default {
 	onPrefsLoad,
 	addTableRowStatusNames,
@@ -410,4 +489,6 @@ export default {
 	resetTableOpenItem,
 	saveTableOpenItem,
 	setTableVisibilityOpenItem,
+	setCompletionOptionsVisibility,
+	saveCompletionThreshold,
 };
