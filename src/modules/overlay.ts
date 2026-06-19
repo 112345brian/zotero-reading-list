@@ -129,9 +129,15 @@ export default class ZoteroReadingList {
 			listener: (event: { pageNumber: number }) => void;
 		}
 	> = new Map();
+	// Last seen page per reader instance, for sequential-advance detection
+	private readerPreviousPage: Map<string, number> = new Map();
 	private saveDebounceTimers: Map<number, ReturnType<typeof setTimeout>> =
 		new Map();
 	private isReaderTrackerPatched = false;
+
+	// Maximum page advance considered genuine reading (not a jump to footnote/TOC).
+	// 5 handles single-page turns, two-page spreads, and fast scrolling via arrow keys.
+	private static readonly MAX_READING_ADVANCE = 5;
 
 	constructor() {
 		this.initialiseDefaultPreferences();
@@ -663,6 +669,7 @@ export default class ZoteroReadingList {
 			pdfApp.eventBus?.off("pagechanging", listener);
 		}
 		this.readerTrackerListeners.clear();
+		this.readerPreviousPage.clear();
 
 		// Flush any pending debounced saves
 		for (const timer of this.saveDebounceTimers.values()) {
@@ -708,11 +715,19 @@ export default class ZoteroReadingList {
 			// Detect where back matter begins (references, appendix, etc.)
 			const contentEndPage = await detectContentEndPage(pdfApp);
 
+			// Seed previous-page with the reader's current position
+			const startPage = pdfApp.page ?? 1;
+			this.readerPreviousPage.set(reader._instanceID, startPage);
+
 			// Listen to pdf.js page-change events
+			const instanceID = reader._instanceID;
 			const listener = ({ pageNumber }: { pageNumber: number }) => {
+				const prev = this.readerPreviousPage.get(instanceID) ?? pageNumber;
+				this.readerPreviousPage.set(instanceID, pageNumber);
 				void this.onPageChange(
 					parentItem,
 					pageNumber,
+					prev,
 					totalPages,
 					contentEndPage,
 				);
@@ -723,16 +738,6 @@ export default class ZoteroReadingList {
 				pdfApp,
 				listener,
 			});
-
-			// Check the page the reader is already on
-			if (pdfApp.page) {
-				void this.onPageChange(
-					parentItem,
-					pdfApp.page,
-					totalPages,
-					contentEndPage,
-				);
-			}
 		} catch (e) {
 			ztoolkit.log(`[ReadingProgress] setup error: ${e}`);
 		}
@@ -740,10 +745,18 @@ export default class ZoteroReadingList {
 
 	private async onPageChange(
 		parentItem: Zotero.Item,
-		pageNumber: number, // 1-indexed
+		pageNumber: number, // 1-indexed, current page
+		previousPage: number, // 1-indexed, page before this event
 		totalPages: number,
 		contentEndPage: number | null, // 1-indexed page where back matter starts, or null
 	) {
+		const delta = pageNumber - previousPage;
+
+		// Only count as reading progress when advancing sequentially.
+		// Large positive jumps (footnote links, TOC clicks) and backward jumps
+		// (going back to check something) are navigation, not reading.
+		if (delta <= 0 || delta > ZoteroReadingList.MAX_READING_ADVANCE) return;
+
 		const progressStrs = getItemExtraProperty(
 			parentItem,
 			READ_PROGRESS_EXTRA_FIELD,
@@ -752,7 +765,7 @@ export default class ZoteroReadingList {
 			progressStrs.length === 1 ? parseProgress(progressStrs[0]) : null;
 		const currentHwm = currentProgress?.highwaterPage ?? 0;
 
-		if (pageNumber <= currentHwm) return; // no new ground covered
+		if (pageNumber <= currentHwm) return; // already recorded this ground
 
 		setItemExtraProperty(
 			parentItem,
