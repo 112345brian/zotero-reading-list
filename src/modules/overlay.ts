@@ -132,13 +132,16 @@ export default class ZoteroReadingList {
 	> = new Map();
 	// Last seen page per reader instance, for sequential-advance detection
 	private readerPreviousPage: Map<string, number> = new Map();
+	// contentEndPage per attachment item ID, so we can check completion on reader close
+	private contentEndPageCache: Map<number, number | null> = new Map();
 	private saveDebounceTimers: Map<number, ReturnType<typeof setTimeout>> =
 		new Map();
 	private isReaderTrackerPatched = false;
 
-	// Maximum page advance considered genuine reading (not a jump to footnote/TOC).
-	// 5 handles single-page turns, two-page spreads, and fast scrolling via arrow keys.
-	private static readonly MAX_READING_ADVANCE = 5;
+	// Maximum page advance treated as sequential reading vs. a navigation jump.
+	// 15 tolerates fast scroll wheel / arrow-key bursts that skip pages; genuine
+	// footnote links (usually 50–200 pages away) are still filtered out.
+	private static readonly MAX_READING_ADVANCE = 15;
 
 	constructor() {
 		this.initialiseDefaultPreferences();
@@ -512,6 +515,39 @@ export default class ZoteroReadingList {
 					}
 				}
 			}
+
+			if (action == "close") {
+				// Re-check completion when a PDF is closed, catching cases where the
+				// user jumped to the last few pages rather than scrolling there.
+				if (!getPref(AUTO_COMPLETE_PREF)) return;
+				const attachmentItems = Zotero.Items.get(ids as number[]);
+				for (const attachment of attachmentItems) {
+					const parentItem = attachment.parentItem ?? attachment;
+					const progressStrs = getItemExtraProperty(
+						parentItem,
+						READ_PROGRESS_EXTRA_FIELD,
+					);
+					if (progressStrs.length !== 1) continue;
+					const progress = parseProgress(progressStrs[0]);
+					if (!progress) continue;
+
+					const contentEndPage =
+						this.contentEndPageCache.get(attachment.id) ?? null;
+					const threshold =
+						((getPref(COMPLETION_THRESHOLD_PREF) as number) ?? 90) /
+						100;
+					const completionPage =
+						contentEndPage ??
+						Math.ceil(progress.totalPages * threshold);
+
+					if (progress.highwaterPage >= completionPage) {
+						const completionStatus = this.resolveCompletionStatus();
+						if (getItemReadStatus(parentItem) !== completionStatus) {
+							setItemReadStatus(parentItem, completionStatus);
+						}
+					}
+				}
+			}
 		};
 
 		this.fileOpenedListenerID = Zotero.Notifier.registerObserver(
@@ -713,6 +749,7 @@ export default class ZoteroReadingList {
 		}
 		this.readerTrackerListeners.clear();
 		this.readerPreviousPage.clear();
+		this.contentEndPageCache.clear();
 
 		// Flush any pending debounced saves
 		for (const timer of this.saveDebounceTimers.values()) {
@@ -757,6 +794,9 @@ export default class ZoteroReadingList {
 
 			// Detect where back matter begins (references, appendix, etc.)
 			const contentEndPage = await detectContentEndPage(pdfApp);
+
+			// Cache so the file-close handler can re-check completion without the PDF open
+			this.contentEndPageCache.set(reader._item.id, contentEndPage);
 
 			// Seed previous-page with the reader's current position
 			const startPage = pdfApp.page ?? 1;
