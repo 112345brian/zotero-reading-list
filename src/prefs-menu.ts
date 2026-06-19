@@ -12,6 +12,7 @@ import {
 	AUTO_COMPLETE_PREF,
 	COMPLETION_STATUS_PREF,
 	COMPLETION_THRESHOLD_PREF,
+	NEW_STATUS_EXPIRY_DAYS_PREF,
 	prefStringToList,
 	listToPrefString,
 } from "./modules/overlay";
@@ -37,6 +38,7 @@ function onPrefsLoad(window: Window) {
 	fillCompletionStatusMenuList(window);
 	setCompletionOptionsVisibility(window);
 	setCompletionThresholdValue(window);
+	setNewStatusExpiryDaysValue(window);
 }
 
 function resetPrefsMenu(window: Window) {
@@ -480,6 +482,26 @@ function saveCompletionThreshold(window: Window) {
 	}
 }
 
+function setNewStatusExpiryDaysValue(window: Window) {
+	const input = window.document.getElementById(
+		"new-status-expiry-days-input",
+	) as HTMLInputElement;
+	if (input) {
+		input.value = String(getPref(NEW_STATUS_EXPIRY_DAYS_PREF) ?? 7);
+	}
+}
+
+function saveNewStatusExpiryDays(window: Window) {
+	const input = window.document.getElementById(
+		"new-status-expiry-days-input",
+	) as HTMLInputElement;
+	if (input) {
+		const val = Math.max(0, parseInt(input.value, 10) || 0);
+		setPref(NEW_STATUS_EXPIRY_DAYS_PREF, val);
+		input.value = String(val);
+	}
+}
+
 export default {
 	onPrefsLoad,
 	addTableRowStatusNames,
@@ -491,4 +513,5 @@ export default {
 	setTableVisibilityOpenItem,
 	setCompletionOptionsVisibility,
 	saveCompletionThreshold,
+	saveNewStatusExpiryDays,
 };

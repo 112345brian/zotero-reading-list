@@ -41,3 +41,6 @@ pref-auto-complete-on-finish =
     .label = Automatically mark items as finished when you reach the end
 pref-completion-threshold-label = Completion threshold (% of pages, used when no table of contents is detected)
 pref-completion-status-label = Status to set on completion
+
+pref-newstatus-title = New Item Expiry
+pref-new-status-expiry-days-label = Automatically move "New" items to the next status after this many days (0 to disable)

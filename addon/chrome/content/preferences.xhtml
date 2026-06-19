@@ -110,6 +110,17 @@
 		</menulist>
 	</groupbox>
 
+	<!-- New item expiry -->
+	<groupbox>
+		<label>
+			<html:h2 data-l10n-id="pref-newstatus-title"></html:h2>
+		</label>
+		<html:label data-l10n-id="pref-new-status-expiry-days-label" />
+		<html:input id="new-status-expiry-days-input" type="number" min="0"
+			preference="extensions.zotero.__addonRef__.new-status-expiry-days"
+			onchange="Zotero.__addonInstance__.prefsMenu.saveNewStatusExpiryDays(window)" />
+	</groupbox>
+
 	<!-- Smart Reading Completion -->
 	<groupbox>
 		<label>

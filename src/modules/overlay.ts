@@ -54,6 +54,7 @@ export const STATUS_CHANGE_ON_OPEN_ITEM_LIST_PREF =
 export const AUTO_COMPLETE_PREF = "auto-complete-on-finish";
 export const COMPLETION_THRESHOLD_PREF = "completion-threshold"; // integer 0–100
 export const COMPLETION_STATUS_PREF = "completion-status"; // status name to set on finish
+export const NEW_STATUS_EXPIRY_DAYS_PREF = "new-status-expiry-days"; // 0 = disabled
 
 enum ReadStatusFormat {
 	ShowBoth = 0,
@@ -162,6 +163,7 @@ export default class ZoteroReadingList {
 		this.addPreferenceUpdateObservers();
 		this.removeReadStatusFromExports();
 		this.addProgressTracker();
+		void this.sweepExpiredNewStatus();
 	}
 
 	public unload() {
@@ -214,6 +216,7 @@ export default class ZoteroReadingList {
 		initialiseDefaultPref(AUTO_COMPLETE_PREF, true);
 		initialiseDefaultPref(COMPLETION_THRESHOLD_PREF, 90);
 		initialiseDefaultPref(COMPLETION_STATUS_PREF, "");
+		initialiseDefaultPref(NEW_STATUS_EXPIRY_DAYS_PREF, 7);
 
 		// for migrating from old label new items pref (true or false) to new format pref (disabled or choose read status to use)
 		// true -> automatically label as first read status
@@ -624,6 +627,46 @@ export default class ZoteroReadingList {
 
 	unpatchExportFunction() {
 		$unpatch$(Zotero.Utilities.Internal, "itemToExportFormat");
+	}
+
+	// ── New-status expiry ─────────────────────────────────────────────────
+
+	async sweepExpiredNewStatus() {
+		const expiryDays = (getPref(NEW_STATUS_EXPIRY_DAYS_PREF) as number) ?? 7;
+		if (expiryDays <= 0) return;
+
+		const newStatus = this.statusNames[0];
+		if (!newStatus) return;
+
+		// The status to transition to after expiry — second status if available
+		const expiredStatus = this.statusNames[1] ?? null;
+
+		const expiryMs = expiryDays * 24 * 60 * 60 * 1000;
+		const cutoff = Date.now() - expiryMs;
+
+		const allItems = await Zotero.Items.getAll(
+			Zotero.Libraries.userLibraryID,
+		);
+
+		for (const item of allItems) {
+			if (!item.isRegularItem()) continue;
+			if (getItemReadStatus(item) !== newStatus) continue;
+
+			const dateStrs = getItemExtraProperty(item, READ_DATE_EXTRA_FIELD);
+			if (dateStrs.length !== 1) continue;
+
+			const labeledAt = new Date(dateStrs[0]).getTime();
+			if (isNaN(labeledAt) || labeledAt > cutoff) continue;
+
+			// Expired — move to next status or clear
+			if (expiredStatus) {
+				setItemReadStatus(item, expiredStatus);
+			} else {
+				clearItemExtraProperty(item, READ_STATUS_EXTRA_FIELD);
+				clearItemExtraProperty(item, READ_DATE_EXTRA_FIELD);
+				void item.saveTx();
+			}
+		}
 	}
 
 	// ── Reading progress tracking ──────────────────────────────────────────
