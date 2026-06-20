@@ -13,8 +13,10 @@ import {
 	COMPLETION_STATUS_PREF,
 	COMPLETION_THRESHOLD_PREF,
 	NEW_STATUS_EXPIRY_DAYS_PREF,
+	HTML_DWELL_SECONDS_PREF,
 	prefStringToList,
 	listToPrefString,
+	initializeUntrackedItems,
 } from "./modules/overlay";
 import { getPref, setPref } from "./utils/prefs";
 import { getString } from "./utils/locale";
@@ -39,6 +41,7 @@ function onPrefsLoad(window: Window) {
 	setCompletionOptionsVisibility(window);
 	setCompletionThresholdValue(window);
 	setNewStatusExpiryDaysValue(window);
+	setHtmlDwellSecondsValue(window);
 }
 
 function resetPrefsMenu(window: Window) {
@@ -437,10 +440,10 @@ function fillCompletionStatusMenuList(window: Window) {
 	if (savedIndex >= 0) {
 		menuList.selectedIndex = savedIndex;
 	} else {
-		const readLikeIndex = statusNames.findIndex((n) => /read/i.test(n));
+		const exactReadIndex = statusNames.findIndex((n) => /^read$/i.test(n));
 		menuList.selectedIndex =
-			readLikeIndex >= 0
-				? readLikeIndex
+			exactReadIndex >= 0
+				? exactReadIndex
 				: Math.min(3, statusNames.length - 1);
 	}
 }
@@ -502,6 +505,49 @@ function saveNewStatusExpiryDays(window: Window) {
 	}
 }
 
+function setHtmlDwellSecondsValue(window: Window) {
+	const input = window.document.getElementById(
+		"html-dwell-seconds-input",
+	) as HTMLInputElement;
+	if (input) {
+		input.value = String(getPref(HTML_DWELL_SECONDS_PREF) ?? 15);
+	}
+}
+
+async function applyToUntrackedItems(window: Window) {
+	const button = window.document.getElementById(
+		"initialize-untracked-button",
+	) as HTMLButtonElement;
+	const label = window.document.getElementById(
+		"initialize-untracked-result",
+	) as HTMLElement;
+	if (button) button.disabled = true;
+	if (label) label.textContent = "Working…";
+
+	const defaultStatus = getPref(LABEL_NEW_ITEMS_PREF) as string;
+	const [statusNames] = prefStringToList(
+		getPref(STATUS_NAME_AND_ICON_LIST_PREF) as string,
+	);
+	const status =
+		statusNames.includes(defaultStatus) ? defaultStatus : (statusNames[0] ?? "");
+
+	const count = await initializeUntrackedItems(status);
+
+	if (button) button.disabled = false;
+	if (label) label.textContent = `Done — ${count} item${count === 1 ? "" : "s"} initialized.`;
+}
+
+function saveHtmlDwellSeconds(window: Window) {
+	const input = window.document.getElementById(
+		"html-dwell-seconds-input",
+	) as HTMLInputElement;
+	if (input) {
+		const val = Math.max(0, parseInt(input.value, 10) || 15);
+		setPref(HTML_DWELL_SECONDS_PREF, val);
+		input.value = String(val);
+	}
+}
+
 export default {
 	onPrefsLoad,
 	addTableRowStatusNames,
@@ -514,4 +560,6 @@ export default {
 	setCompletionOptionsVisibility,
 	saveCompletionThreshold,
 	saveNewStatusExpiryDays,
+	saveHtmlDwellSeconds,
+	applyToUntrackedItems,
 };

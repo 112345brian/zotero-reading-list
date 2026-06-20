@@ -44,3 +44,9 @@ pref-completion-status-label = Status to set on completion
 
 pref-newstatus-title = New Item Expiry
 pref-new-status-expiry-days-label = Automatically move "New" items to the next status after this many days (0 to disable)
+
+pref-html-dwell-seconds-label = Seconds to stay near the end of an article before marking it complete
+
+pref-initialize-title = Initialize Existing Library
+pref-initialize-description = Apply the default read status to all items in your library that the plugin hasn't seen yet.
+pref-initialize-button = Apply to untracked items

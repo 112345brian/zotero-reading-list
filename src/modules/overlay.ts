@@ -25,6 +25,7 @@ const READ_STATUS_COLUMN_ID = "readstatus";
 const READ_STATUS_EXTRA_FIELD = "Read_Status";
 const READ_DATE_EXTRA_FIELD = "Read_Status_Date";
 const READ_PROGRESS_EXTRA_FIELD = "Read_Progress"; // "highwater/total" (1-indexed pages)
+const READ_SCROLL_PROGRESS_EXTRA_FIELD = "Read_Scroll_Progress"; // scroll % (0-100) for HTML
 const READ_LAST_OPEN_EXTRA_FIELD = "Read_Last_Open"; // ISO date of last PDF open
 
 export const DEFAULT_STATUS_NAMES = [
@@ -55,6 +56,7 @@ export const AUTO_COMPLETE_PREF = "auto-complete-on-finish";
 export const COMPLETION_THRESHOLD_PREF = "completion-threshold"; // integer 0–100
 export const COMPLETION_STATUS_PREF = "completion-status"; // status name to set on finish
 export const NEW_STATUS_EXPIRY_DAYS_PREF = "new-status-expiry-days"; // 0 = disabled
+export const HTML_DWELL_SECONDS_PREF = "html-completion-dwell-seconds"; // seconds to stay at threshold
 
 enum ReadStatusFormat {
 	ShowBoth = 0,
@@ -105,6 +107,18 @@ function getSelectedItems() {
 
 export const FORBIDDEN_PREF_STRING_CHARACTERS = new Set(":;|");
 
+export async function initializeUntrackedItems(defaultStatus: string): Promise<number> {
+	const allItems = await Zotero.Items.getAll(Zotero.Libraries.userLibraryID);
+	let count = 0;
+	for (const item of allItems) {
+		if (!item.isRegularItem()) continue;
+		if (getItemReadStatus(item)) continue;
+		setItemReadStatus(item, defaultStatus);
+		count++;
+	}
+	return count;
+}
+
 export function prefStringToList(prefString: string) {
 	const [statusString, iconString] = prefString.split("|");
 	return [statusString.split(";"), iconString.split(";")];
@@ -134,6 +148,18 @@ export default class ZoteroReadingList {
 	private readerPreviousPage: Map<string, number> = new Map();
 	// contentEndPage per attachment item ID, so we can check completion on reader close
 	private contentEndPageCache: Map<number, number | null> = new Map();
+	// Last page the reader was on (updated on every pagechanging, regardless of delta)
+	// Used by the close handler to detect "jumped to end then closed"
+	private readerLastSeenPage: Map<number, number> = new Map();
+	// Snapshot (HTML) tracking
+	private snapshotListeners: Map<
+		string,
+		{ iframeWin: Window; listener: () => void }
+	> = new Map();
+	private snapshotDwellTimers: Map<string, ReturnType<typeof setTimeout>> =
+		new Map();
+	// HWM scroll % (0-100) per attachment ID — persists after reader closes for close handler
+	private snapshotScrollHwm: Map<number, number> = new Map();
 	private saveDebounceTimers: Map<number, ReturnType<typeof setTimeout>> =
 		new Map();
 	private isReaderTrackerPatched = false;
@@ -159,9 +185,10 @@ export default class ZoteroReadingList {
 		if (getPref(LABEL_NEW_ITEMS_PREF) != LABEL_NEW_ITEMS_PREF_DISABLED) {
 			this.addNewItemLabeller();
 		}
-		if (getPref(LABEL_ITEMS_WHEN_OPENING_FILE_PREF)) {
-			this.addFileOpenedListener();
-		}
+		// Always register the file listener — it handles both status-on-open
+		// (guarded by LABEL_ITEMS_WHEN_OPENING_FILE_PREF internally) and
+		// auto-complete-on-close (guarded by AUTO_COMPLETE_PREF internally).
+		this.addFileOpenedListener();
 
 		this.addPreferenceUpdateObservers();
 		this.removeReadStatusFromExports();
@@ -220,6 +247,7 @@ export default class ZoteroReadingList {
 		initialiseDefaultPref(COMPLETION_THRESHOLD_PREF, 90);
 		initialiseDefaultPref(COMPLETION_STATUS_PREF, "");
 		initialiseDefaultPref(NEW_STATUS_EXPIRY_DAYS_PREF, 7);
+		initialiseDefaultPref(HTML_DWELL_SECONDS_PREF, 15);
 
 		// for migrating from old label new items pref (true or false) to new format pref (disabled or choose read status to use)
 		// true -> automatically label as first read status
@@ -272,12 +300,9 @@ export default class ZoteroReadingList {
 			),
 			Zotero.Prefs.registerObserver(
 				getPrefGlobalName(LABEL_ITEMS_WHEN_OPENING_FILE_PREF),
-				(value: boolean) => {
-					if (value) {
-						this.addFileOpenedListener();
-					} else {
-						this.removeFileOpenedListener();
-					}
+				(_value: boolean) => {
+					// The file listener is always registered; the open handler
+					// reads this pref at call time, so no re-registration needed.
 				},
 				true,
 			),
@@ -497,7 +522,7 @@ export default class ZoteroReadingList {
 			ids: string[] | number[],
 			extraData: any,
 		) => {
-			if (action == "open") {
+			if (action == "open" && getPref(LABEL_ITEMS_WHEN_OPENING_FILE_PREF)) {
 				const items = Zotero.Items.getTopLevel(
 					Zotero.Items.get(ids as number[]),
 				);
@@ -517,33 +542,65 @@ export default class ZoteroReadingList {
 			}
 
 			if (action == "close") {
-				// Re-check completion when a PDF is closed, catching cases where the
-				// user jumped to the last few pages rather than scrolling there.
 				if (!getPref(AUTO_COMPLETE_PREF)) return;
 				const attachmentItems = Zotero.Items.get(ids as number[]);
 				for (const attachment of attachmentItems) {
 					const parentItem = attachment.parentItem ?? attachment;
+
+					// ── PDF completion check ──────────────────────────────
 					const progressStrs = getItemExtraProperty(
 						parentItem,
 						READ_PROGRESS_EXTRA_FIELD,
 					);
-					if (progressStrs.length !== 1) continue;
-					const progress = parseProgress(progressStrs[0]);
-					if (!progress) continue;
+					if (progressStrs.length === 1) {
+						const progress = parseProgress(progressStrs[0]);
+						if (progress) {
+							const contentEndPage =
+								this.contentEndPageCache.get(attachment.id) ??
+								null;
+							const threshold =
+								((getPref(COMPLETION_THRESHOLD_PREF) as number) ??
+									90) / 100;
+							const completionPage =
+								contentEndPage ??
+								Math.ceil(progress.totalPages * threshold);
+							const lastSeen =
+								this.readerLastSeenPage.get(attachment.id) ?? 0;
+							const effectivePage = Math.max(
+								progress.highwaterPage,
+								lastSeen,
+							);
+							if (effectivePage >= completionPage) {
+								const completionStatus =
+									this.resolveCompletionStatus();
+								if (
+									getItemReadStatus(parentItem) !==
+									completionStatus
+								) {
+									setItemReadStatus(
+										parentItem,
+										completionStatus,
+									);
+								}
+							}
+							continue; // handled as PDF
+						}
+					}
 
-					const contentEndPage =
-						this.contentEndPageCache.get(attachment.id) ?? null;
-					const threshold =
-						((getPref(COMPLETION_THRESHOLD_PREF) as number) ?? 90) /
-						100;
-					const completionPage =
-						contentEndPage ??
-						Math.ceil(progress.totalPages * threshold);
-
-					if (progress.highwaterPage >= completionPage) {
-						const completionStatus = this.resolveCompletionStatus();
-						if (getItemReadStatus(parentItem) !== completionStatus) {
-							setItemReadStatus(parentItem, completionStatus);
+					// ── Snapshot (HTML) completion check ─────────────────
+					// On close, if HWM scroll % was at/past the threshold, count it.
+					const scrollHwm = this.snapshotScrollHwm.get(attachment.id);
+					if (scrollHwm !== undefined) {
+						const threshold =
+							(getPref(COMPLETION_THRESHOLD_PREF) as number) ?? 90;
+						if (scrollHwm >= threshold) {
+							const completionStatus =
+								this.resolveCompletionStatus();
+							if (
+								getItemReadStatus(parentItem) !== completionStatus
+							) {
+								setItemReadStatus(parentItem, completionStatus);
+							}
 						}
 					}
 				}
@@ -650,6 +707,10 @@ export default class ZoteroReadingList {
 						);
 						extraText = removeFieldValueFromExtraData(
 							extraText,
+							READ_SCROLL_PROGRESS_EXTRA_FIELD,
+						);
+						extraText = removeFieldValueFromExtraData(
+							extraText,
 							READ_LAST_OPEN_EXTRA_FIELD,
 						);
 						// eslint-disable-next-line @typescript-eslint/no-unsafe-member-access
@@ -750,6 +811,18 @@ export default class ZoteroReadingList {
 		this.readerTrackerListeners.clear();
 		this.readerPreviousPage.clear();
 		this.contentEndPageCache.clear();
+		this.readerLastSeenPage.clear();
+
+		// Clean up snapshot (HTML) listeners and dwell timers
+		for (const { iframeWin, listener } of this.snapshotListeners.values()) {
+			iframeWin.removeEventListener("scroll", listener);
+		}
+		this.snapshotListeners.clear();
+		for (const timer of this.snapshotDwellTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.snapshotDwellTimers.clear();
+		this.snapshotScrollHwm.clear();
 
 		// Flush any pending debounced saves
 		for (const timer of this.saveDebounceTimers.values()) {
@@ -764,6 +837,12 @@ export default class ZoteroReadingList {
 	}
 
 	private async setupReaderTracking(reader: _ZoteroTypes.ReaderInstance) {
+		if (reader.type === "snapshot") {
+			void this.setupSnapshotTracking(
+				reader as _ZoteroTypes.ReaderInstance<"snapshot">,
+			);
+			return;
+		}
 		if (reader.type !== "pdf") return;
 		if (this.readerTrackerListeners.has(reader._instanceID)) return;
 
@@ -804,9 +883,12 @@ export default class ZoteroReadingList {
 
 			// Listen to pdf.js page-change events
 			const instanceID = reader._instanceID;
+			const attachmentID = reader._item.id;
 			const listener = ({ pageNumber }: { pageNumber: number }) => {
 				const prev = this.readerPreviousPage.get(instanceID) ?? pageNumber;
 				this.readerPreviousPage.set(instanceID, pageNumber);
+				// Always track last seen page regardless of delta (used by close handler)
+				this.readerLastSeenPage.set(attachmentID, pageNumber);
 				void this.onPageChange(
 					parentItem,
 					pageNumber,
@@ -823,6 +905,103 @@ export default class ZoteroReadingList {
 			});
 		} catch (e) {
 			ztoolkit.log(`[ReadingProgress] setup error: ${e}`);
+		}
+	}
+
+	private async setupSnapshotTracking(
+		reader: _ZoteroTypes.ReaderInstance<"snapshot">,
+	) {
+		if (this.snapshotListeners.has(reader._instanceID)) return;
+
+		try {
+			await reader._initPromise;
+
+			const snapshotView = reader._primaryView;
+			await snapshotView.initializedPromise;
+
+			// _iframeWindow is protected on DOMView; access via cast
+			const iframeWin = (snapshotView as any)
+				._iframeWindow as (Window & typeof globalThis) | undefined;
+			if (!iframeWin) return;
+
+			const parentItem = reader._item.parentItem ?? reader._item;
+			const attachmentID = reader._item.id;
+			const instanceID = reader._instanceID;
+
+			// Record open date
+			setItemExtraProperty(
+				parentItem,
+				READ_LAST_OPEN_EXTRA_FIELD,
+				new Date().toISOString(),
+			);
+			this.debouncedSave(parentItem);
+
+			const getScrollPct = (): number => {
+				const doc = iframeWin.document;
+				const scrollable =
+					doc.documentElement.scrollHeight - iframeWin.innerHeight;
+				if (scrollable <= 0) return 100;
+				return Math.min(
+					100,
+					Math.round((iframeWin.scrollY / scrollable) * 100),
+				);
+			};
+
+			const threshold =
+				(getPref(COMPLETION_THRESHOLD_PREF) as number) ?? 90;
+
+			const listener = () => {
+				const pct = getScrollPct();
+
+				// Update HWM
+				const prevHwm = this.snapshotScrollHwm.get(attachmentID) ?? 0;
+				if (pct > prevHwm) {
+					this.snapshotScrollHwm.set(attachmentID, pct);
+					setItemExtraProperty(
+						parentItem,
+						READ_SCROLL_PROGRESS_EXTRA_FIELD,
+						String(pct),
+					);
+					this.debouncedSave(parentItem);
+				}
+
+				if (!getPref(AUTO_COMPLETE_PREF)) return;
+
+				if (pct >= threshold) {
+					// At or past threshold — start dwell timer if not already running
+					if (!this.snapshotDwellTimers.has(instanceID)) {
+						const dwellMs =
+							((getPref(HTML_DWELL_SECONDS_PREF) as number) ?? 15) *
+							1000;
+						this.snapshotDwellTimers.set(
+							instanceID,
+							setTimeout(() => {
+								this.snapshotDwellTimers.delete(instanceID);
+								const completionStatus =
+									this.resolveCompletionStatus();
+								if (
+									getItemReadStatus(parentItem) !==
+									completionStatus
+								) {
+									setItemReadStatus(parentItem, completionStatus);
+								}
+							}, dwellMs),
+						);
+					}
+				} else {
+					// Scrolled back above threshold — cancel dwell timer
+					const timer = this.snapshotDwellTimers.get(instanceID);
+					if (timer !== undefined) {
+						clearTimeout(timer);
+						this.snapshotDwellTimers.delete(instanceID);
+					}
+				}
+			};
+
+			iframeWin.addEventListener("scroll", listener, { passive: true });
+			this.snapshotListeners.set(instanceID, { iframeWin, listener });
+		} catch (e) {
+			ztoolkit.log(`[ReadingProgress] snapshot setup error: ${e}`);
 		}
 	}
 
@@ -875,13 +1054,12 @@ export default class ZoteroReadingList {
 	private resolveCompletionStatus(): string {
 		const saved = getPref(COMPLETION_STATUS_PREF) as string;
 		if (saved && this.statusNames.includes(saved)) return saved;
-		// Default: first status whose name contains "read" (case-insensitive),
-		// otherwise the 4th status (index 3), otherwise the last status.
-		const readLike = this.statusNames.find((n) =>
-			/read/i.test(n),
-		);
+		// Prefer an exact case-insensitive "Read" match, then the 4th status
+		// (index 3 = "Read" in default list), then the last status.
+		// Avoid partial matches like "To Read" or "Not Reading".
+		const exactRead = this.statusNames.find((n) => /^read$/i.test(n));
 		return (
-			readLike ??
+			exactRead ??
 			this.statusNames[3] ??
 			this.statusNames[this.statusNames.length - 1]
 		);

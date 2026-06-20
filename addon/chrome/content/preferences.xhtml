@@ -121,6 +121,18 @@
 			onchange="Zotero.__addonInstance__.prefsMenu.saveNewStatusExpiryDays(window)" />
 	</groupbox>
 
+	<!-- Initialize existing library -->
+	<groupbox>
+		<label>
+			<html:h2 data-l10n-id="pref-initialize-title"></html:h2>
+		</label>
+		<html:p data-l10n-id="pref-initialize-description" />
+		<html:button id="initialize-untracked-button"
+			onclick="Zotero.__addonInstance__.prefsMenu.applyToUntrackedItems(window)"
+			data-l10n-id="pref-initialize-button" />
+		<html:span id="initialize-untracked-result" style="margin-left: 8px; font-style: italic;" />
+	</groupbox>
+
 	<!-- Smart Reading Completion -->
 	<groupbox>
 		<label>
@@ -141,6 +153,11 @@
 			<html:input id="completion-threshold-input" type="number" min="1" max="100"
 				preference="extensions.zotero.__addonRef__.completion-threshold"
 				onchange="Zotero.__addonInstance__.prefsMenu.saveCompletionThreshold(window)" />
+			<html:br />
+			<html:label data-l10n-id="pref-html-dwell-seconds-label" />
+			<html:input id="html-dwell-seconds-input" type="number" min="0"
+				preference="extensions.zotero.__addonRef__.html-completion-dwell-seconds"
+				onchange="Zotero.__addonInstance__.prefsMenu.saveHtmlDwellSeconds(window)" />
 		</html:div>
 	</groupbox>
 </vbox>
