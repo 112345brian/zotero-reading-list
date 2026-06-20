@@ -162,6 +162,8 @@ export default class ZoteroReadingList {
 	private snapshotScrollHwm: Map<number, number> = new Map();
 	// EPUB tracker instanceIDs (no scroll listener to clean up, just need to know we've set them up)
 	private epubTrackers: Set<string> = new Set();
+	// Last pageIndex seen per EPUB instance — used to detect sequential vs. jump navigation
+	private epubPreviousPageIndex: Map<string, number> = new Map();
 	private saveDebounceTimers: Map<number, ReturnType<typeof setTimeout>> =
 		new Map();
 	private isReaderTrackerPatched = false;
@@ -826,6 +828,7 @@ export default class ZoteroReadingList {
 		this.snapshotDwellTimers.clear();
 		this.snapshotScrollHwm.clear();
 		this.epubTrackers.clear();
+		this.epubPreviousPageIndex.clear();
 
 		// Flush any pending debounced saves
 		for (const timer of this.saveDebounceTimers.values()) {
@@ -1037,6 +1040,13 @@ export default class ZoteroReadingList {
 
 			const threshold = (getPref(COMPLETION_THRESHOLD_PREF) as number) ?? 90;
 
+			// Seed the starting page so the first stats update has a reference point
+			const initialStats = (reader as any)._state
+				?.primaryViewStats as _ZoteroTypes.Reader.ViewStats | undefined;
+			if (initialStats?.pageIndex !== undefined) {
+				this.epubPreviousPageIndex.set(instanceID, initialStats.pageIndex);
+			}
+
 			const onStatsUpdate = () => {
 				const stats = (reader as any)._state?.primaryViewStats as
 					| _ZoteroTypes.Reader.ViewStats
@@ -1047,8 +1057,31 @@ export default class ZoteroReadingList {
 					stats.pagesCount <= 1
 				)
 					return;
+
+				const currentPageIndex = stats.pageIndex;
+				const prevPageIndex = this.epubPreviousPageIndex.get(instanceID);
+				this.epubPreviousPageIndex.set(instanceID, currentPageIndex);
+
+				// Ignore jumps (footnotes, appendix links, TOC navigation).
+				// Only count sequential forward reading within MAX_READING_ADVANCE pages.
+				if (prevPageIndex !== undefined) {
+					const delta = currentPageIndex - prevPageIndex;
+					if (
+						delta > ZoteroReadingList.MAX_READING_ADVANCE ||
+						delta < -ZoteroReadingList.MAX_READING_ADVANCE
+					) {
+						// Big jump — cancel any active dwell timer and bail
+						const timer = this.snapshotDwellTimers.get(instanceID);
+						if (timer !== undefined) {
+							clearTimeout(timer);
+							this.snapshotDwellTimers.delete(instanceID);
+						}
+						return;
+					}
+				}
+
 				const pct = Math.round(
-					(stats.pageIndex / (stats.pagesCount - 1)) * 100,
+					(currentPageIndex / (stats.pagesCount - 1)) * 100,
 				);
 
 				const prevHwm = this.snapshotScrollHwm.get(attachmentID) ?? 0;
