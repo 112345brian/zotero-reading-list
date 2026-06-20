@@ -7,8 +7,8 @@ An extension for Zotero that allows setting the read status of items.
 - default read statuses are: `⭐ New`, `📙 To Read`, `📖 In Progress`, `📗 Read`, or `📕 Not Reading`
 - custom read statuses are also supported
 - newly added items can be automatically labelled
-- an item's read status can be automatically updated when opening its attached PDF or HTML snapshot
-- **items are automatically marked complete when you finish reading them** (PDF page threshold or HTML scroll position + dwell time)
+- an item's read status can be automatically updated when opening its attached PDF, EPUB, or HTML snapshot
+- **items are automatically marked complete when you finish reading them** (works with PDFs, EPUBs, and HTML snapshots — uses page position or scroll position + configurable dwell time)
 - new items automatically advance to the next status after a configurable number of days
 
 ![windows dark theme overview](https://github.com/Dominic-DallOsto/zotero-reading-list/assets/26859884/e35ef424-02cd-4bec-8866-3e1d30c9aadf)
@@ -52,13 +52,16 @@ Under Edit → Settings → Reading List you can configure the following options
 ### PDFs
 The plugin tracks which pages you visit. When you close a PDF, if the furthest page you reached (or the last page you had open) is within the completion threshold of the end, the item is automatically marked with your chosen completion status.
 
+### EPUBs
+The plugin tracks your page position within the book. Once you reach the completion threshold (default 90% through), a timer starts. If you stay there for the configured dwell time (default 15 seconds) without navigating back, the item is marked complete. Closing the book while past the threshold also triggers completion.
+
 ### HTML Snapshots
 The plugin tracks your scroll position. Once you scroll to within the completion threshold of the bottom, a timer starts. If you stay there for the configured dwell time (default 15 seconds) without scrolling back up, the item is marked complete. Closing the article while past the threshold also triggers completion.
 
 ## Differences from Upstream
 
 This fork adds:
-- **Smart Reading Completion** — auto-marks PDFs and HTML articles as read when you finish them
-- **HTML scroll tracking** — works with saved web page snapshots, not just PDFs
+- **Smart Reading Completion** — auto-marks PDFs, EPUBs, and HTML articles as read when you finish them
+- **EPUB and HTML tracking** — works with all Zotero reader types, not just PDFs
 - **New Item Expiry** — automatically advances stale "New" items
 - **Initialize Existing Library** — one-click setup for pre-existing libraries
