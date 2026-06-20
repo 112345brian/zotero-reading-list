@@ -158,8 +158,10 @@ export default class ZoteroReadingList {
 	> = new Map();
 	private snapshotDwellTimers: Map<string, ReturnType<typeof setTimeout>> =
 		new Map();
-	// HWM scroll % (0-100) per attachment ID — persists after reader closes for close handler
+	// HWM progress % (0-100) per attachment ID — shared by snapshot and epub trackers
 	private snapshotScrollHwm: Map<number, number> = new Map();
+	// EPUB tracker instanceIDs (no scroll listener to clean up, just need to know we've set them up)
+	private epubTrackers: Set<string> = new Set();
 	private saveDebounceTimers: Map<number, ReturnType<typeof setTimeout>> =
 		new Map();
 	private isReaderTrackerPatched = false;
@@ -823,6 +825,7 @@ export default class ZoteroReadingList {
 		}
 		this.snapshotDwellTimers.clear();
 		this.snapshotScrollHwm.clear();
+		this.epubTrackers.clear();
 
 		// Flush any pending debounced saves
 		for (const timer of this.saveDebounceTimers.values()) {
@@ -840,6 +843,12 @@ export default class ZoteroReadingList {
 		if (reader.type === "snapshot") {
 			void this.setupSnapshotTracking(
 				reader as _ZoteroTypes.ReaderInstance<"snapshot">,
+			);
+			return;
+		}
+		if (reader.type === "epub") {
+			void this.setupEpubTracking(
+				reader as _ZoteroTypes.ReaderInstance<"epub">,
 			);
 			return;
 		}
@@ -1002,6 +1011,93 @@ export default class ZoteroReadingList {
 			this.snapshotListeners.set(instanceID, { iframeWin, listener });
 		} catch (e) {
 			ztoolkit.log(`[ReadingProgress] snapshot setup error: ${e}`);
+		}
+	}
+
+	private async setupEpubTracking(
+		reader: _ZoteroTypes.ReaderInstance<"epub">,
+	) {
+		if (this.epubTrackers.has(reader._instanceID)) return;
+
+		try {
+			await reader._initPromise;
+			const epubView = reader._primaryView as _ZoteroTypes.Reader.EPUBView;
+			await epubView.initializedPromise;
+
+			const parentItem = reader._item.parentItem ?? reader._item;
+			const attachmentID = reader._item.id;
+			const instanceID = reader._instanceID;
+
+			setItemExtraProperty(
+				parentItem,
+				READ_LAST_OPEN_EXTRA_FIELD,
+				new Date().toISOString(),
+			);
+			this.debouncedSave(parentItem);
+
+			const threshold = (getPref(COMPLETION_THRESHOLD_PREF) as number) ?? 90;
+
+			const onStatsUpdate = () => {
+				const stats = (reader as any)._state?.primaryViewStats as
+					| _ZoteroTypes.Reader.ViewStats
+					| undefined;
+				if (
+					stats?.pageIndex === undefined ||
+					!stats.pagesCount ||
+					stats.pagesCount <= 1
+				)
+					return;
+				const pct = Math.round(
+					(stats.pageIndex / (stats.pagesCount - 1)) * 100,
+				);
+
+				const prevHwm = this.snapshotScrollHwm.get(attachmentID) ?? 0;
+				if (pct > prevHwm) {
+					this.snapshotScrollHwm.set(attachmentID, pct);
+					setItemExtraProperty(
+						parentItem,
+						READ_SCROLL_PROGRESS_EXTRA_FIELD,
+						String(pct),
+					);
+					this.debouncedSave(parentItem);
+				}
+
+				if (!getPref(AUTO_COMPLETE_PREF)) return;
+
+				if (pct >= threshold) {
+					if (!this.snapshotDwellTimers.has(instanceID)) {
+						const dwellMs =
+							((getPref(HTML_DWELL_SECONDS_PREF) as number) ?? 15) * 1000;
+						this.snapshotDwellTimers.set(
+							instanceID,
+							setTimeout(() => {
+								this.snapshotDwellTimers.delete(instanceID);
+								const completionStatus = this.resolveCompletionStatus();
+								if (getItemReadStatus(parentItem) !== completionStatus) {
+									setItemReadStatus(parentItem, completionStatus);
+								}
+							}, dwellMs),
+						);
+					}
+				} else {
+					const timer = this.snapshotDwellTimers.get(instanceID);
+					if (timer !== undefined) {
+						clearTimeout(timer);
+						this.snapshotDwellTimers.delete(instanceID);
+					}
+				}
+			};
+
+			// Hook into _updateViewStats which fires on every page navigation
+			const orig = (epubView as any)._updateViewStats.bind(epubView);
+			(epubView as any)._updateViewStats = function () {
+				orig();
+				onStatsUpdate();
+			};
+
+			this.epubTrackers.add(instanceID);
+		} catch (e) {
+			ztoolkit.log(`[ReadingProgress] epub setup error: ${e}`);
 		}
 	}
 
