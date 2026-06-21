@@ -3,7 +3,7 @@
 	"version": "1.5.19",
 	"description": "Keep track of whether you've read items in Zotero",
 	"config": {
-		"addonName": "Zotero Reading List",
+		"addonName": "Smart Reading List",
 		"addonID": "reading-list@hotmail.com",
 		"addonRef": "zotero-reading-list",
 		"addonInstance": "ZoteroReadingList",

@@ -164,6 +164,17 @@ export default class ZoteroReadingList {
 	private epubTrackers: Set<string> = new Set();
 	// Last pageIndex seen per EPUB instance — used to detect sequential vs. jump navigation
 	private epubPreviousPageIndex: Map<string, number> = new Map();
+	// Rapid-advance (velocity) tracking: consecutive fast events → navigation, not reading
+	private epubVelocityTracker: Map<
+		string,
+		{ time: number; rapidCount: number }
+	> = new Map();
+	private pdfVelocityTracker: Map<
+		string,
+		{ time: number; rapidCount: number }
+	> = new Map();
+	// Count of sequential forward page-advances made per attachment — gates dwell timer
+	private epubSequentialAdvances: Map<number, number> = new Map();
 	private saveDebounceTimers: Map<number, ReturnType<typeof setTimeout>> =
 		new Map();
 	private isReaderTrackerPatched = false;
@@ -829,6 +840,9 @@ export default class ZoteroReadingList {
 		this.snapshotScrollHwm.clear();
 		this.epubTrackers.clear();
 		this.epubPreviousPageIndex.clear();
+		this.epubVelocityTracker.clear();
+		this.epubSequentialAdvances.clear();
+		this.pdfVelocityTracker.clear();
 
 		// Flush any pending debounced saves
 		for (const timer of this.saveDebounceTimers.values()) {
@@ -901,6 +915,15 @@ export default class ZoteroReadingList {
 				this.readerPreviousPage.set(instanceID, pageNumber);
 				// Always track last seen page regardless of delta (used by close handler)
 				this.readerLastSeenPage.set(attachmentID, pageNumber);
+
+				// Velocity check: >4 consecutive events <400ms apart = key held down to skip
+				const now = Date.now();
+				const vel = this.pdfVelocityTracker.get(instanceID);
+				const elapsed = vel ? now - vel.time : Infinity;
+				const rapidCount = vel && elapsed < 400 ? vel.rapidCount + 1 : 0;
+				this.pdfVelocityTracker.set(instanceID, { time: now, rapidCount });
+				if (rapidCount >= 4) return;
+
 				void this.onPageChange(
 					parentItem,
 					pageNumber,
@@ -1017,6 +1040,57 @@ export default class ZoteroReadingList {
 		}
 	}
 
+	// Returns the fraction (0–1) of the spine where back matter begins,
+	// or 1.0 if no back matter is detected.
+	private detectEpubBackmatterFraction(book: ePubJS.Book): number {
+		const BACKMATTER_LABELS = /^(references?|bibliography|bibliographies|index|indices|appendix|appendices|notes?|acknowledgements?|glossary|afterword|colophon|about the author|copyright|permissions?)$/i;
+		const BACKMATTER_LANDMARK_TYPES = new Set([
+			"backmatter",
+			"bibliography",
+			"index",
+			"glossary",
+			"acknowledgements",
+			"appendix",
+		]);
+
+		const spine = (book as any).spine as { length: number; spineItems: { index: number; href: string }[] };
+		const spineLength = spine?.length ?? 0;
+		if (spineLength <= 1) return 1.0;
+
+		// Check EPUB landmarks first — most authoritative
+		const landmarks = book.navigation?.landmarks ?? [];
+		for (const lm of landmarks) {
+			if (lm.type && BACKMATTER_LANDMARK_TYPES.has(lm.type.toLowerCase())) {
+				// Find the spine index for this href
+				const href = lm.href?.split("#")[0] ?? "";
+				const idx = spine.spineItems?.findIndex((s) =>
+					s.href.endsWith(href),
+				) ?? -1;
+				if (idx > 0) return idx / spineLength;
+			}
+		}
+
+		// Fall back: scan last 40% of TOC items for back matter labels
+		const flattenToc = (items: import("epubjs/types/navigation").NavItem[]): import("epubjs/types/navigation").NavItem[] =>
+			items.flatMap((item) => [item, ...flattenToc(item.subitems ?? [])]);
+		const toc = flattenToc(book.navigation?.toc ?? []);
+		if (toc.length === 0) return 1.0;
+
+		const searchFrom = Math.floor(toc.length * 0.6);
+		for (let i = searchFrom; i < toc.length; i++) {
+			if (BACKMATTER_LABELS.test(toc[i].label.trim())) {
+				// Map toc item back to spine fraction
+				const href = toc[i].href?.split("#")[0] ?? "";
+				const idx = spine.spineItems?.findIndex((s) =>
+					s.href.endsWith(href),
+				) ?? -1;
+				if (idx > 0) return idx / spineLength;
+			}
+		}
+
+		return 1.0;
+	}
+
 	private async setupEpubTracking(
 		reader: _ZoteroTypes.ReaderInstance<"epub">,
 	) {
@@ -1038,14 +1112,77 @@ export default class ZoteroReadingList {
 			);
 			this.debouncedSave(parentItem);
 
-			const threshold = (getPref(COMPLETION_THRESHOLD_PREF) as number) ?? 90;
+			// If the EPUB is in scrolled (continuous) mode, delegate to scroll tracking
+			// instead of page-index tracking.
+			const viewState = (reader as any)._state
+				?.primaryViewState as _ZoteroTypes.Reader.EPUBViewState | undefined;
+			if (viewState?.flowMode === "scrolled") {
+				const iframeWin = (epubView as any)
+					._iframeWindow as (Window & typeof globalThis) | undefined;
+				if (iframeWin) {
+					const getScrollPct = (): number => {
+						const doc = iframeWin.document;
+						const scrollable =
+							doc.documentElement.scrollHeight - iframeWin.innerHeight;
+						if (scrollable <= 0) return 100;
+						return Math.min(
+							100,
+							Math.round((iframeWin.scrollY / scrollable) * 100),
+						);
+					};
+					const threshold =
+						(getPref(COMPLETION_THRESHOLD_PREF) as number) ?? 90;
+					const listener = () => {
+						const pct = getScrollPct();
+						const prevHwm = this.snapshotScrollHwm.get(attachmentID) ?? 0;
+						if (pct > prevHwm) {
+							this.snapshotScrollHwm.set(attachmentID, pct);
+							setItemExtraProperty(parentItem, READ_SCROLL_PROGRESS_EXTRA_FIELD, String(pct));
+							this.debouncedSave(parentItem);
+						}
+						if (!getPref(AUTO_COMPLETE_PREF)) return;
+						if (pct >= threshold) {
+							if (!this.snapshotDwellTimers.has(instanceID)) {
+								const dwellMs = ((getPref(HTML_DWELL_SECONDS_PREF) as number) ?? 15) * 1000;
+								this.snapshotDwellTimers.set(instanceID, setTimeout(() => {
+									this.snapshotDwellTimers.delete(instanceID);
+									const completionStatus = this.resolveCompletionStatus();
+									if (getItemReadStatus(parentItem) !== completionStatus) {
+										setItemReadStatus(parentItem, completionStatus);
+									}
+								}, dwellMs));
+							}
+						} else {
+							const timer = this.snapshotDwellTimers.get(instanceID);
+							if (timer !== undefined) { clearTimeout(timer); this.snapshotDwellTimers.delete(instanceID); }
+						}
+					};
+					iframeWin.addEventListener("scroll", listener, { passive: true });
+					this.snapshotListeners.set(instanceID, { iframeWin, listener });
+					this.epubTrackers.add(instanceID);
+				}
+				return;
+			}
 
-			// Seed the starting page so the first stats update has a reference point
+			// Paginated mode: track by page index.
+
+			// Detect where back matter begins so we don't require reading the index.
+			const backmatterFraction = this.detectEpubBackmatterFraction(epubView.book);
+
+			// Seed starting page index
 			const initialStats = (reader as any)._state
 				?.primaryViewStats as _ZoteroTypes.Reader.ViewStats | undefined;
 			if (initialStats?.pageIndex !== undefined) {
 				this.epubPreviousPageIndex.set(instanceID, initialStats.pageIndex);
 			}
+
+			const cancelDwellTimer = () => {
+				const timer = this.snapshotDwellTimers.get(instanceID);
+				if (timer !== undefined) {
+					clearTimeout(timer);
+					this.snapshotDwellTimers.delete(instanceID);
+				}
+			};
 
 			const onStatsUpdate = () => {
 				const stats = (reader as any)._state?.primaryViewStats as
@@ -1059,45 +1196,69 @@ export default class ZoteroReadingList {
 					return;
 
 				const currentPageIndex = stats.pageIndex;
+				const pagesCount = stats.pagesCount;
+
+				// Relative jump threshold — scales with document size
+				const maxAdvance = Math.max(3, Math.min(50, Math.round(pagesCount * 0.02)));
+
 				const prevPageIndex = this.epubPreviousPageIndex.get(instanceID);
 				this.epubPreviousPageIndex.set(instanceID, currentPageIndex);
 
-				// Ignore jumps (footnotes, appendix links, TOC navigation).
-				// Only count sequential forward reading within MAX_READING_ADVANCE pages.
 				if (prevPageIndex !== undefined) {
 					const delta = currentPageIndex - prevPageIndex;
-					if (
-						delta > ZoteroReadingList.MAX_READING_ADVANCE ||
-						delta < -ZoteroReadingList.MAX_READING_ADVANCE
-					) {
-						// Big jump — cancel any active dwell timer and bail
-						const timer = this.snapshotDwellTimers.get(instanceID);
-						if (timer !== undefined) {
-							clearTimeout(timer);
-							this.snapshotDwellTimers.delete(instanceID);
-						}
+
+					// Jump detection: large advance or backward jump → navigation, not reading
+					if (delta > maxAdvance || delta < -maxAdvance) {
+						cancelDwellTimer();
 						return;
+					}
+
+					// Velocity check: sustained rapid advancing (e.g. holding down arrow key
+					// to skip to end) is navigation. Threshold: >4 consecutive advances
+					// arriving faster than 400ms apart.
+					const now = Date.now();
+					const vel = this.epubVelocityTracker.get(instanceID);
+					const elapsed = vel ? now - vel.time : Infinity;
+					const rapidCount = vel && elapsed < 400 ? vel.rapidCount + 1 : 0;
+					this.epubVelocityTracker.set(instanceID, { time: now, rapidCount });
+					if (rapidCount >= 4) {
+						cancelDwellTimer();
+						return;
+					}
+
+					// Count sequential forward advances (used to gate dwell timer)
+					if (delta > 0) {
+						const prev = this.epubSequentialAdvances.get(attachmentID) ?? 0;
+						this.epubSequentialAdvances.set(attachmentID, prev + 1);
 					}
 				}
 
-				const pct = Math.round(
-					(currentPageIndex / (stats.pagesCount - 1)) * 100,
-				);
+				// Adjust effective pagesCount for back matter
+				const effectivePagesCount = Math.round(pagesCount * backmatterFraction);
+				const pct = Math.round((currentPageIndex / Math.max(1, effectivePagesCount - 1)) * 100);
+				const clampedPct = Math.min(100, pct);
 
 				const prevHwm = this.snapshotScrollHwm.get(attachmentID) ?? 0;
-				if (pct > prevHwm) {
-					this.snapshotScrollHwm.set(attachmentID, pct);
+				if (clampedPct > prevHwm) {
+					this.snapshotScrollHwm.set(attachmentID, clampedPct);
 					setItemExtraProperty(
 						parentItem,
 						READ_SCROLL_PROGRESS_EXTRA_FIELD,
-						String(pct),
+						String(clampedPct),
 					);
 					this.debouncedSave(parentItem);
 				}
 
 				if (!getPref(AUTO_COMPLETE_PREF)) return;
 
-				if (pct >= threshold) {
+				const threshold = (getPref(COMPLETION_THRESHOLD_PREF) as number) ?? 90;
+
+				// Minimum sequential advances required before completion can trigger.
+				// Scales with document size so long books require more actual reading.
+				const minAdvances = Math.max(3, Math.round(pagesCount * 0.03));
+				const advances = this.epubSequentialAdvances.get(attachmentID) ?? 0;
+
+				if (clampedPct >= threshold && advances >= minAdvances) {
 					if (!this.snapshotDwellTimers.has(instanceID)) {
 						const dwellMs =
 							((getPref(HTML_DWELL_SECONDS_PREF) as number) ?? 15) * 1000;
@@ -1113,11 +1274,7 @@ export default class ZoteroReadingList {
 						);
 					}
 				} else {
-					const timer = this.snapshotDwellTimers.get(instanceID);
-					if (timer !== undefined) {
-						clearTimeout(timer);
-						this.snapshotDwellTimers.delete(instanceID);
-					}
+					cancelDwellTimer();
 				}
 			};
 
@@ -1143,10 +1300,14 @@ export default class ZoteroReadingList {
 	) {
 		const delta = pageNumber - previousPage;
 
+		// Relative jump threshold — scales with document length.
+		// A 50-page paper tolerates 5-page bursts; a 1000-page textbook tolerates 30.
+		const maxAdvance = Math.max(5, Math.min(50, Math.round(totalPages * 0.03)));
+
 		// Only count as reading progress when advancing sequentially.
 		// Large positive jumps (footnote links, TOC clicks) and backward jumps
 		// (going back to check something) are navigation, not reading.
-		if (delta <= 0 || delta > ZoteroReadingList.MAX_READING_ADVANCE) return;
+		if (delta <= 0 || delta > maxAdvance) return;
 
 		const progressStrs = getItemExtraProperty(
 			parentItem,
